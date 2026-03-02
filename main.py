@@ -4,10 +4,12 @@ This module contains the Qt main window, rendering orchestration, asynchronous
 loading/build threads, color pipelines, and UI settings.
 """
 import math
+import os
 import sys
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -189,7 +191,7 @@ I18N = {
         "multi_off": "Multi mode: OFF",
         "multi_on": "Multi mode: ON",
         "reset_data": "Reset data",
-        "reset_camera": "Reset camera",
+        "refresh_data": "Refresh data",
         "remove_tile": "Remove tile",
         "filters": "Filters",
         "point_class_filters": "Point class filters",
@@ -212,6 +214,7 @@ I18N = {
         "processing": "Processing...",
         "reading_laz": "Reading LAZ files...",
         "preparing_scene": "Preparing scene...",
+        "refreshing_data": "Refreshing scene...",
         "generating_surface": "Generating surface...",
         "sat_coloring": "Satellite coloring z{zoom}...",
         "multi_active": "Multi mode active: add one or more .laz files.",
@@ -243,6 +246,9 @@ I18N = {
         "selected_tile": "Selected tile: {name}",
         "scene_build_error": "Scene build error: {error}",
         "no_active_points": "No active points to display (check filters).",
+        "copy_report": "Copy report",
+        "copy_report_tip": "Copy diagnostics (errors, warnings, loaded tiles) to clipboard",
+        "report_copied": "Diagnostics report copied to clipboard.",
     },
     "fr": {
         "window_title": "LiDAR Viewer V3",
@@ -251,7 +257,7 @@ I18N = {
         "multi_off": "Mode multi : OFF",
         "multi_on": "Mode multi : ON",
         "reset_data": "R?initialiser les donn?es",
-        "reset_camera": "R?initialiser la cam?ra",
+        "refresh_data": "Rafra?chir l'affichage",
         "remove_tile": "Supprimer la tuile",
         "filters": "Filtres",
         "point_class_filters": "Filtres des classes de points",
@@ -274,6 +280,7 @@ I18N = {
         "processing": "Traitement...",
         "reading_laz": "Lecture des fichiers LAZ...",
         "preparing_scene": "Pr?paration de la sc?ne...",
+        "refreshing_data": "Rafra?chissement de la sc?ne...",
         "generating_surface": "G?n?ration de la surface...",
         "sat_coloring": "Colorisation satellite z{zoom}...",
         "multi_active": "Mode multi actif : ajoute un ou plusieurs fichiers .laz.",
@@ -305,6 +312,9 @@ I18N = {
         "selected_tile": "Tuile s?lectionn?e : {name}",
         "scene_build_error": "Erreur de pr?paration de sc?ne : {error}",
         "no_active_points": "Aucun point actif ? afficher (v?rifie les filtres).",
+        "copy_report": "Copier rapport",
+        "copy_report_tip": "Copier le diagnostic (erreurs, avertissements, tuiles) dans le presse-papiers",
+        "report_copied": "Rapport de diagnostic copi? dans le presse-papiers.",
     },
 }
 
@@ -320,7 +330,8 @@ class LoaderThread(QThread):
     def run(self):
         loaded_tiles = []
         warnings = []
-        max_workers = max(1, min(4, len(self.paths)))
+        cpu = os.cpu_count() or 4
+        max_workers = max(1, min(len(self.paths), 8, max(4, cpu - 1)))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {ex.submit(load_laz_tile, path): path for path in self.paths}
             for fut in as_completed(futures):
@@ -335,10 +346,14 @@ class LoaderThread(QThread):
                     warnings.append(f"{Path(src_path).name}: empty file")
                     continue
 
+                # Keep tile points in float32 to reduce RAM pressure in multi-tile sessions.
+                pts = np.asarray(tile.points, dtype=np.float32)
+                if not pts.flags["C_CONTIGUOUS"]:
+                    pts = np.ascontiguousarray(pts, dtype=np.float32)
                 loaded_tiles.append(
                     {
                         "path": tile.path,
-                        "points": tile.points,
+                        "points": pts,
                         "crs": tile.crs,
                         "classification": tile.classification,
                     }
@@ -514,7 +529,7 @@ class SatelliteColorThread(QThread):
 
 
 class SceneBuildThread(QThread):
-    built = pyqtSignal(int, object, object, object, object, object, object, object, object)
+    built = pyqtSignal(int, object, object, object, object, object, object, object)
     failed = pyqtSignal(int, str)
 
     def __init__(self, request_id, tiles_snapshot):
@@ -525,13 +540,12 @@ class SceneBuildThread(QThread):
     def run(self):
         try:
             if not self.tiles_snapshot:
-                self.built.emit(self.request_id, None, None, None, None, None, None, None, None)
+                self.built.emit(self.request_id, None, None, None, None, None, None, None)
                 return
 
-            all_points = []
-            all_classes = []
             tile_info = {}
-            offset = 0
+            total_points = 0
+            sum_xyz = np.zeros(3, dtype=np.float64)
             for tile in self.tiles_snapshot:
                 pts = tile["points"]
                 cls = tile.get("classification")
@@ -540,23 +554,38 @@ class SceneBuildThread(QThread):
                 else:
                     cls = np.asarray(cls, dtype=np.uint8)
 
-                all_points.append(pts)
-                all_classes.append(cls)
+                n = len(pts)
+                if n == 0:
+                    continue
+                total_points += n
+                sum_xyz += np.sum(pts, axis=0, dtype=np.float64)
                 tile_info[tile["path"]] = {
-                    "start": offset,
-                    "end": offset + len(pts),
+                    "start": 0,
+                    "end": 0,
                     "center_world": pts.mean(axis=0).astype(np.float64),
                     "min_world": np.min(pts, axis=0).astype(np.float64),
                     "max_world": np.max(pts, axis=0).astype(np.float64),
                     "classification": cls,
                 }
-                offset += len(pts)
+            if total_points == 0:
+                self.built.emit(self.request_id, None, None, None, None, None, None, None)
+                return
 
-            pts_world = np.vstack(all_points).astype(np.float64, copy=False)
-            classes_full = np.concatenate(all_classes).astype(np.uint8, copy=False)
-
-            world_center = pts_world.mean(axis=0, dtype=np.float64)
-            pts_centered = pts_world - world_center
+            world_center = sum_xyz / float(total_points)
+            pts_centered = np.empty((total_points, 3), dtype=np.float32)
+            classes_full = np.empty(total_points, dtype=np.uint8)
+            offset = 0
+            for tile in self.tiles_snapshot:
+                pts = tile["points"]
+                n = len(pts)
+                if n == 0:
+                    continue
+                cls = tile_info[tile["path"]]["classification"]
+                tile_info[tile["path"]]["start"] = offset
+                tile_info[tile["path"]]["end"] = offset + n
+                pts_centered[offset : offset + n] = (pts - world_center).astype(np.float32, copy=False)
+                classes_full[offset : offset + n] = cls
+                offset += n
 
             z = pts_centered[:, 2]
             den = float(np.ptp(z))
@@ -570,8 +599,7 @@ class SceneBuildThread(QThread):
 
             self.built.emit(
                 self.request_id,
-                pts_world,
-                pts_centered.astype(np.float32),
+                pts_centered,
                 z_norm,
                 active_crs,
                 world_center,
@@ -833,7 +861,6 @@ class MainWindow(QMainWindow):
         self.tile_outline_items = {}
         self.tile_fill_items = {}
         self.surface_items = {}
-        self.points_world = None
         self.points_centered = None
         self.world_center = None
         self.z_norm_full = None
@@ -865,6 +892,7 @@ class MainWindow(QMainWindow):
         self.surface_pending_rebuild = False
         self.selected_tile_path = None
         self.last_load_warnings = []
+        self.last_error_message = ""
 
         self.sat_colorizer = SatelliteColorizer()
         self._base_font_size = QApplication.font().pointSizeF()
@@ -887,10 +915,10 @@ class MainWindow(QMainWindow):
         self.btn_clear.clicked.connect(self.clear_loaded_data)
         self.btn_clear.setToolTip("Clear all loaded tiles")
 
-        self.btn_reset = QPushButton(self._t("reset_camera"))
+        self.btn_reset = QPushButton(self._t("refresh_data"))
         self.btn_reset.setMinimumHeight(28)
-        self.btn_reset.clicked.connect(self.reset_camera)
-        self.btn_reset.setToolTip("Reset camera to default view")
+        self.btn_reset.clicked.connect(self.refresh_data)
+        self.btn_reset.setToolTip("Rebuild display from loaded tiles")
 
         self.tile_select_combo = QComboBox()
         self.tile_select_combo.setMinimumHeight(28)
@@ -908,6 +936,11 @@ class MainWindow(QMainWindow):
         self.btn_filters.setMinimumHeight(28)
         self.btn_filters.toggled.connect(self.toggle_filter_popup)
         self.btn_filters.setToolTip("Show/hide class filters popup")
+
+        self.btn_copy_report = QPushButton(self._t("copy_report"))
+        self.btn_copy_report.setMinimumHeight(28)
+        self.btn_copy_report.clicked.connect(self.copy_diagnostics_report)
+        self.btn_copy_report.setToolTip(self._t("copy_report_tip"))
 
         self.color_mode_combo = QComboBox()
         self.color_mode_combo.addItems(
@@ -975,11 +1008,12 @@ class MainWindow(QMainWindow):
         self.actions_layout.addWidget(self.tile_select_combo)
         self.actions_layout.addWidget(self.btn_remove_tile)
         self.actions_layout.addWidget(self.btn_filters)
+        self.actions_layout.addStretch()
+        self.actions_layout.addWidget(self.btn_copy_report)
         self.btn_settings = QPushButton(self._t("settings"))
         self.btn_settings.setMinimumHeight(28)
         self.btn_settings.clicked.connect(self.open_settings_dialog)
         self.actions_layout.addWidget(self.btn_settings)
-        self.actions_layout.addStretch()
 
         self.lbl_view = QLabel(self._t("view"))
         self.lbl_surface = QLabel(self._t("surface"))
@@ -1082,6 +1116,7 @@ class MainWindow(QMainWindow):
             self.tile_select_combo,
             self.btn_remove_tile,
             self.btn_filters,
+            self.btn_copy_report,
             self.btn_settings,
             self.color_mode_combo,
             self.sat_zoom_combo,
@@ -1305,6 +1340,9 @@ class MainWindow(QMainWindow):
         self.status_kwargs = kwargs
         self._set_status(self._t(key, **kwargs), remember=True)
 
+    def _remember_error(self, message):
+        self.last_error_message = str(message or "").strip()
+
     def _apply_status_text(self):
         if not hasattr(self, "status"):
             return
@@ -1317,9 +1355,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(self._t("window_title"))
         self.btn_multi.setText(self._t("multi_on") if self.multi_mode else self._t("multi_off"))
         self.btn_clear.setText(self._t("reset_data"))
-        self.btn_reset.setText(self._t("reset_camera"))
+        self.btn_reset.setText(self._t("refresh_data"))
         self.btn_remove_tile.setText(self._t("remove_tile"))
         self.btn_filters.setText(self._t("filters"))
+        self.btn_copy_report.setText(self._t("copy_report"))
+        self.btn_copy_report.setToolTip(self._t("copy_report_tip"))
         self.btn_settings.setText(self._t("settings"))
         self.lbl_view.setText(self._t("view"))
         self.lbl_surface.setText(self._t("surface"))
@@ -1368,6 +1408,35 @@ class MainWindow(QMainWindow):
             self._place_busy_popup()
             self._place_filter_popup()
             self._update_tile_centers_overlay()
+
+    def copy_diagnostics_report(self):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            f"LiDAR View diagnostics - {now}",
+            f"Status: {getattr(self, '_status_full_text', '')}",
+            f"Last error: {self.last_error_message or '-'}",
+            f"Warnings count: {len(self.last_load_warnings)}",
+        ]
+        if self.last_load_warnings:
+            lines.append("Warnings:")
+            for w in self.last_load_warnings:
+                lines.append(f"- {w}")
+
+        lines.append(f"Loaded tiles: {len(self.tiles)}")
+        if self.tiles:
+            lines.append("Tiles:")
+            for path in sorted(self.tiles.keys()):
+                t = self.tiles[path]
+                n = len(t["points"]) if t.get("points") is not None else 0
+                crs = t.get("crs") or "Unknown CRS"
+                lines.append(f"- {Path(path).name} | points={n:,} | crs={crs}")
+
+        lines.append(f"View mode: {self.view_mode_combo.currentText()}")
+        lines.append(f"Color mode: {self.color_mode_combo.currentText()}")
+        lines.append(f"Multi mode: {'ON' if self.multi_mode else 'OFF'}")
+
+        QApplication.clipboard().setText("\n".join(lines))
+        self._set_status_key("report_copied")
 
     def toggle_multi_mode(self, enabled):
         self.multi_mode = enabled
@@ -1743,6 +1812,7 @@ class MainWindow(QMainWindow):
         self.thread.start()
 
     def on_tiles_loaded(self, loaded_tiles, warnings):
+        self._remember_error("")
         if self.pending_replace_all:
             self.tiles.clear()
 
@@ -1762,6 +1832,7 @@ class MainWindow(QMainWindow):
         self.thread = None
 
     def on_load_failed(self, message):
+        self._remember_error(message)
         self._set_status(message)
         self.btn_load.setEnabled(True)
         self.pending_replace_all = False
@@ -1793,7 +1864,6 @@ class MainWindow(QMainWindow):
     def _on_scene_built(
         self,
         request_id,
-        pts_world,
         pts_centered,
         z_norm,
         active_crs,
@@ -1805,8 +1875,7 @@ class MainWindow(QMainWindow):
         if request_id != self.scene_active_request:
             return
 
-        if pts_world is None:
-            self.points_world = None
+        if pts_centered is None:
             self.points_centered = None
             self.world_center = None
             self.z_norm_full = None
@@ -1829,7 +1898,6 @@ class MainWindow(QMainWindow):
             self._set_busy(False)
             return
 
-        self.points_world = pts_world
         self.points_centered = pts_centered
         self.world_center = world_center
         self.z_norm_full = z_norm
@@ -1846,7 +1914,7 @@ class MainWindow(QMainWindow):
         self._refresh_class_filters()
         self._update_tile_centers_overlay()
         if not self._is_manual_surface():
-            rec = self._recommended_surface_grid(len(self.points_world))
+            rec = self._recommended_surface_grid(len(self.points_centered))
             self.surface_precision_spin.blockSignals(True)
             self.surface_precision_spin.setValue(rec)
             self.surface_precision_spin.blockSignals(False)
@@ -1875,6 +1943,7 @@ class MainWindow(QMainWindow):
     def _on_scene_build_failed(self, request_id, error):
         if request_id != self.scene_active_request:
             return
+        self._remember_error(error)
         self._set_busy(False)
         self._set_status(self._t("scene_build_error", error=error))
 
@@ -1889,7 +1958,6 @@ class MainWindow(QMainWindow):
 
     def clear_loaded_data(self):
         self.tiles.clear()
-        self.points_world = None
         self.points_centered = None
         self.world_center = None
         self.z_norm_full = None
@@ -1971,12 +2039,11 @@ class MainWindow(QMainWindow):
         if mode == 1:
             try:
                 zoom = int(self.sat_zoom_combo.currentText())
-                cache = self._ensure_sat_cache(zoom)
                 colors = self._build_altitude_colors(idx)
 
-                known = np.isfinite(cache[idx, 0])
+                known, cached_colors = self._lookup_satellite_cache(zoom, idx)
                 if np.any(known):
-                    colors[known] = cache[idx[known]]
+                    colors[known] = cached_colors[known]
 
                 missing_idx = idx[~known]
                 if len(missing_idx) > 0:
@@ -2006,6 +2073,31 @@ class MainWindow(QMainWindow):
             base += f" | {note}"
         self._set_status(base)
 
+    def refresh_data(self):
+        if self.thread is not None and self.thread.isRunning():
+            self._set_status_key("loading_in_progress")
+            return
+        if len(self.tiles) == 0:
+            self._set_status_key("no_tiles_loaded")
+            return
+
+        # Refresh rebuilds scene data/caches without dropping loaded tiles.
+        self._set_status(self._t("refreshing_data"))
+        self.sat_color_cache.clear()
+        self.sat_note_cache.clear()
+        self.sat_pending_request = None
+        self.sat_payload.clear()
+        self.sat_active_request = None
+        self.surface_active_request = None
+        self.surface_pending_rebuild = False
+        self._clear_surface_items()
+        if self.scatter is not None:
+            self.scatter.setData(
+                pos=np.empty((0, 3), dtype=np.float32),
+                color=np.empty((0, 4), dtype=np.float32),
+            )
+        self._start_scene_build()
+
     def reset_camera(self):
         self.view.setCameraPosition(distance=80, azimuth=45, elevation=20)
 
@@ -2024,7 +2116,7 @@ class MainWindow(QMainWindow):
         self.surface_items.clear()
 
     def _request_surface_rebuild(self):
-        if self.points_world is None or self.world_center is None or len(self.tiles) == 0:
+        if self.points_centered is None or self.world_center is None or len(self.tiles) == 0:
             return
         self.surface_pending_rebuild = True
         if self.surface_thread is not None and self.surface_thread.isRunning():
@@ -2114,6 +2206,7 @@ class MainWindow(QMainWindow):
     def _on_surface_failed(self, request_id, error):
         if request_id != self.surface_active_request:
             return
+        self._remember_error(error)
         self._set_busy(False)
         self.last_color_note = f"surface error: {error}"
         if self._is_surface_view():
@@ -2122,13 +2215,61 @@ class MainWindow(QMainWindow):
             self._launch_surface_rebuild()
 
     def _ensure_sat_cache(self, zoom):
-        total = len(self.points_world) if self.points_world is not None else 0
         cache = self.sat_color_cache.get(zoom)
-        if cache is None or len(cache) != total:
-            cache = np.full((total, 4), np.nan, dtype=np.float32)
-            cache[:, 3] = 1.0
+        if cache is None:
+            cache = {
+                "indices": np.empty(0, dtype=np.int64),
+                "colors": np.empty((0, 4), dtype=np.float32),
+            }
             self.sat_color_cache[zoom] = cache
         return cache
+
+    def _lookup_satellite_cache(self, zoom, idx):
+        cache = self._ensure_sat_cache(zoom)
+        known = np.zeros(len(idx), dtype=bool)
+        colors = np.empty((len(idx), 4), dtype=np.float32)
+        colors[:, 0:3] = np.nan
+        colors[:, 3] = 1.0
+        if len(idx) == 0 or len(cache["indices"]) == 0:
+            return known, colors
+
+        pos = np.searchsorted(cache["indices"], idx)
+        valid = (pos >= 0) & (pos < len(cache["indices"]))
+        valid_idx = np.flatnonzero(valid)
+        if len(valid_idx) == 0:
+            return known, colors
+        match = cache["indices"][pos[valid_idx]] == idx[valid_idx]
+        if np.any(match):
+            good = valid_idx[match]
+            known[good] = True
+            colors[good] = cache["colors"][pos[good]]
+        return known, colors
+
+    def _store_satellite_cache(self, zoom, idx, colors):
+        if idx is None or len(idx) == 0:
+            return
+        cache = self._ensure_sat_cache(zoom)
+        idx = np.asarray(idx, dtype=np.int64)
+        colors = np.asarray(colors, dtype=np.float32)
+        if len(idx) != len(colors):
+            return
+
+        all_idx = np.concatenate([cache["indices"], idx])
+        all_colors = np.concatenate([cache["colors"], colors], axis=0)
+        order = np.argsort(all_idx, kind="mergesort")
+        all_idx = all_idx[order]
+        all_colors = all_colors[order]
+
+        if len(all_idx) > 1:
+            rev_idx = all_idx[::-1]
+            _uniq, first_rev = np.unique(rev_idx, return_index=True)
+            keep = (len(all_idx) - 1 - first_rev)
+            keep.sort()
+            all_idx = all_idx[keep]
+            all_colors = all_colors[keep]
+
+        cache["indices"] = all_idx
+        cache["colors"] = all_colors
 
     def _request_satellite_colors(self, idx, zoom):
         if self.active_crs is None:
@@ -2138,8 +2279,8 @@ class MainWindow(QMainWindow):
             return
 
         unique_idx = np.unique(idx)
-        cache = self._ensure_sat_cache(zoom)
-        unresolved = unique_idx[~np.isfinite(cache[unique_idx, 0])]
+        known, _colors = self._lookup_satellite_cache(zoom, unique_idx)
+        unresolved = unique_idx[~known]
         if len(unresolved) == 0:
             return
 
@@ -2161,7 +2302,10 @@ class MainWindow(QMainWindow):
         self.sat_active_request = request_id
         self.sat_payload[request_id] = (idx, zoom)
 
-        world_xy = self.points_world[idx, :2].astype(np.float64, copy=False)
+        world_xy = (
+            self.points_centered[idx, :2].astype(np.float64, copy=False)
+            + self.world_center[:2].astype(np.float64, copy=False)
+        )
         self.sat_thread = SatelliteColorThread(
             request_id=request_id,
             points_world_xy=world_xy,
@@ -2178,8 +2322,7 @@ class MainWindow(QMainWindow):
         payload = self.sat_payload.pop(request_id, None)
         if payload:
             idx, zoom = payload
-            cache = self._ensure_sat_cache(zoom)
-            cache[idx] = colors
+            self._store_satellite_cache(zoom, idx, colors)
             if sat_msg:
                 self.sat_note_cache[zoom] = sat_msg
 
@@ -2191,6 +2334,7 @@ class MainWindow(QMainWindow):
 
     def _on_satellite_failed(self, request_id, error):
         payload = self.sat_payload.pop(request_id, None)
+        self._remember_error(error)
         if payload:
             _idx, zoom = payload
             self.sat_note_cache[zoom] = f"tiles unavailable: {error}"
