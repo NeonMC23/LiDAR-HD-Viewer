@@ -97,6 +97,9 @@ python .\main.py
 - `Theme`: Midnight, Dawn, Volcanic, Forest, Blueprint, Sandstone
 - `UI scale`: global interface scaling
 - `Popup width`: responsive width ratio for busy/filter popups (15% to 60%)
+- `Max points / tile`: hard cap applied during load to avoid per-tile RAM spikes
+- `Global points budget`: total point budget across loaded tiles
+- `Load workers`: number of concurrent loader workers (lower value = more responsive UI)
 - `Compact toolbar`: denser top controls
 - `Show tile outlines in 3D`: toggle tile outline + translucent tile area highlight
 
@@ -122,6 +125,8 @@ python .\main.py
 - In multi-tile workflows, append progressively and validate alignment before adding many tiles.
 - If the machine is constrained, enable `Compact toolbar` and lower `Quality`.
 - Tile points are internally kept in `float32` for lower RAM usage in large multi-tile projects.
+- Large imports are automatically downsampled to keep a global RAM point budget.
+- Qt is configured for desktop OpenGL to favor dedicated GPU usage when available on the system.
 
 ## Troubleshooting
 
