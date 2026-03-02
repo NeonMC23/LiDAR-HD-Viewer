@@ -13,6 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+# Best effort for dedicated/discrete GPU usage on desktop drivers.
+os.environ.setdefault("QT_OPENGL", "desktop")
+if os.name == "nt":
+    os.environ.setdefault("PYOPENGL_PLATFORM", "win32")
+
 import pyqtgraph.opengl as gl
 from PyQt6.QtCore import QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QFontMetrics, QVector3D
@@ -46,7 +52,12 @@ from lidar_loader import load_laz_tile
 POINT_SIZE = 1.5
 SAT_TILE_SIZE = 256
 SURFACE_GRID_MIN = 220
-SURFACE_GRID_MAX = 700
+SURFACE_GRID_MAX = 200
+# Soft memory budget for loaded raw points (before centered working arrays).
+# This allows loading larger multi-tile sets without saturating RAM.
+MAX_TOTAL_POINTS_BUDGET = 12_000_000
+# Hard per-tile cap applied at load-time for very dense tiles.
+MAX_POINTS_PER_TILE = 2_500_000
 SAT_DEFAULT_URL = (
     "https://services.arcgisonline.com/ArcGIS/rest/services/"
     "World_Imagery/MapServer/tile/{z}/{y}/{x}"
@@ -225,6 +236,9 @@ I18N = {
         "theme": "Theme",
         "ui_scale": "UI scale (%)",
         "popup_width": "Popup width (%)",
+        "max_points_per_tile": "Max points / tile",
+        "max_total_points_budget": "Global points budget",
+        "loader_workers": "Load workers",
         "show_tile_centers": "Show tile outlines in 3D",
         "compact_toolbar": "Compact toolbar",
         "lang_english": "English",
@@ -291,6 +305,9 @@ I18N = {
         "theme": "Th?me",
         "ui_scale": "?chelle UI (%)",
         "popup_width": "Largeur popups (%)",
+        "max_points_per_tile": "Max points / tuile",
+        "max_total_points_budget": "Budget global de points",
+        "loader_workers": "Workers de chargement",
         "show_tile_centers": "Afficher les contours de tuiles en 3D",
         "compact_toolbar": "Barre compacte",
         "lang_english": "Anglais",
@@ -323,15 +340,16 @@ class LoaderThread(QThread):
     loaded = pyqtSignal(object, object)
     failed = pyqtSignal(str)
 
-    def __init__(self, paths):
+    def __init__(self, paths, max_points_per_tile, max_workers):
         super().__init__()
         self.paths = paths
+        self.max_points_per_tile = max(50_000, int(max_points_per_tile))
+        self.max_workers = max(1, int(max_workers))
 
     def run(self):
         loaded_tiles = []
         warnings = []
-        cpu = os.cpu_count() or 4
-        max_workers = max(1, min(len(self.paths), 8, max(4, cpu - 1)))
+        max_workers = max(1, min(len(self.paths), self.max_workers))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {ex.submit(load_laz_tile, path): path for path in self.paths}
             for fut in as_completed(futures):
@@ -350,12 +368,27 @@ class LoaderThread(QThread):
                 pts = np.asarray(tile.points, dtype=np.float32)
                 if not pts.flags["C_CONTIGUOUS"]:
                     pts = np.ascontiguousarray(pts, dtype=np.float32)
+                cls = tile.classification
+                if cls is not None:
+                    cls = np.asarray(cls, dtype=np.uint8)
+                    if len(cls) != len(pts):
+                        cls = None
+
+                if len(pts) > self.max_points_per_tile:
+                    keep = np.linspace(0, len(pts) - 1, self.max_points_per_tile, dtype=np.int64)
+                    pts = pts[keep]
+                    if cls is not None:
+                        cls = cls[keep]
+                    warnings.append(
+                        f"{Path(src_path).name}: downsampled to {self.max_points_per_tile:,} points "
+                        f"for memory budget."
+                    )
                 loaded_tiles.append(
                     {
                         "path": tile.path,
                         "points": pts,
                         "crs": tile.crs,
-                        "classification": tile.classification,
+                        "classification": cls,
                     }
                 )
 
@@ -791,6 +824,22 @@ class SettingsDialog(QDialog):
         self.popup_width_spin.setSingleStep(5)
         self.popup_width_spin.setValue(int(settings["popup_width_percent"]))
 
+        self.max_points_tile_spin = QSpinBox()
+        self.max_points_tile_spin.setRange(100_000, 20_000_000)
+        self.max_points_tile_spin.setSingleStep(100_000)
+        self.max_points_tile_spin.setValue(int(settings["max_points_per_tile"]))
+
+        self.max_points_total_spin = QSpinBox()
+        self.max_points_total_spin.setRange(1_000_000, 100_000_000)
+        self.max_points_total_spin.setSingleStep(500_000)
+        self.max_points_total_spin.setValue(int(settings["max_total_points_budget"]))
+
+        self.loader_workers_spin = QSpinBox()
+        cpu = os.cpu_count() or 8
+        self.loader_workers_spin.setRange(1, max(2, cpu))
+        self.loader_workers_spin.setSingleStep(1)
+        self.loader_workers_spin.setValue(int(settings["loader_workers"]))
+
         self.compact_check = QCheckBox(parent._t("compact_toolbar"))
         self.compact_check.setChecked(bool(settings["compact_toolbar"]))
 
@@ -803,6 +852,9 @@ class SettingsDialog(QDialog):
         visual_form.addRow(parent._t("theme"), self.theme_combo)
         visual_form.addRow(parent._t("ui_scale"), self.scale_spin)
         visual_form.addRow(parent._t("popup_width"), self.popup_width_spin)
+        visual_form.addRow(parent._t("max_points_per_tile"), self.max_points_tile_spin)
+        visual_form.addRow(parent._t("max_total_points_budget"), self.max_points_total_spin)
+        visual_form.addRow(parent._t("loader_workers"), self.loader_workers_spin)
         visual_form.addRow(self.compact_check)
         visual_form.addRow(self.tile_centers_check)
         visual_group.setLayout(visual_form)
@@ -828,6 +880,9 @@ class SettingsDialog(QDialog):
             "theme": self.theme_combo.currentData(),
             "ui_scale": int(self.scale_spin.value()),
             "popup_width_percent": int(self.popup_width_spin.value()),
+            "max_points_per_tile": int(self.max_points_tile_spin.value()),
+            "max_total_points_budget": int(self.max_points_total_spin.value()),
+            "loader_workers": int(self.loader_workers_spin.value()),
             "compact_toolbar": bool(self.compact_check.isChecked()),
             "show_tile_centers": bool(self.tile_centers_check.isChecked()),
         }
@@ -841,6 +896,9 @@ class MainWindow(QMainWindow):
             "theme": "midnight",
             "ui_scale": 100,
             "popup_width_percent": 18,
+            "max_points_per_tile": MAX_POINTS_PER_TILE,
+            "max_total_points_budget": MAX_TOTAL_POINTS_BUDGET,
+            "loader_workers": max(2, min(4, (os.cpu_count() or 8) - 2)),
             "compact_toolbar": False,
             "show_tile_centers": False,
         }
@@ -1234,6 +1292,17 @@ class MainWindow(QMainWindow):
     def _is_manual_surface(self):
         return self.surface_precision_mode.currentIndex() == 1
 
+    def _max_points_per_tile(self):
+        return max(100_000, int(self.ui_settings.get("max_points_per_tile", MAX_POINTS_PER_TILE)))
+
+    def _max_total_points_budget(self):
+        return max(1_000_000, int(self.ui_settings.get("max_total_points_budget", MAX_TOTAL_POINTS_BUDGET)))
+
+    def _loader_workers(self):
+        cpu = os.cpu_count() or 8
+        val = int(self.ui_settings.get("loader_workers", max(2, min(4, cpu - 2))))
+        return max(1, min(cpu, val))
+
     def _update_sat_controls_state(self):
         self.sat_zoom_combo.setEnabled(self._is_satellite_mode())
 
@@ -1402,12 +1471,22 @@ class MainWindow(QMainWindow):
     def open_settings_dialog(self):
         dlg = SettingsDialog(self, self.ui_settings.copy())
         if dlg.exec():
+            prev_budget = self._max_total_points_budget()
+            prev_tile_cap = self._max_points_per_tile()
             self.ui_settings.update(dlg.values())
             self._apply_app_style()
             self._refresh_ui_texts()
             self._place_busy_popup()
             self._place_filter_popup()
             self._update_tile_centers_overlay()
+            if len(self.tiles) > 0 and (
+                self._max_total_points_budget() != prev_budget
+                or self._max_points_per_tile() != prev_tile_cap
+            ):
+                warn = self._enforce_memory_budget()
+                if warn:
+                    self.last_load_warnings.append(warn)
+                self.refresh_data()
 
     def copy_diagnostics_report(self):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1434,6 +1513,9 @@ class MainWindow(QMainWindow):
         lines.append(f"View mode: {self.view_mode_combo.currentText()}")
         lines.append(f"Color mode: {self.color_mode_combo.currentText()}")
         lines.append(f"Multi mode: {'ON' if self.multi_mode else 'OFF'}")
+        lines.append(f"Max points/tile: {self._max_points_per_tile():,}")
+        lines.append(f"Total points budget: {self._max_total_points_budget():,}")
+        lines.append(f"Load workers: {self._loader_workers()}")
 
         QApplication.clipboard().setText("\n".join(lines))
         self._set_status_key("report_copied")
@@ -1743,6 +1825,10 @@ class MainWindow(QMainWindow):
         return out
 
     def on_color_mode_changed(self, _mode):
+        if not self._is_satellite_mode():
+            self.sat_pending_request = None
+            self.sat_payload.clear()
+            self.sat_active_request = None
         self._update_sat_controls_state()
         self.update_lod(force_recolor=True)
 
@@ -1753,8 +1839,7 @@ class MainWindow(QMainWindow):
         self._update_sat_controls_state()
         if not self._is_surface_view():
             # Invalidate any in-flight surface build so late thread results are ignored.
-            self.surface_active_request = None
-            self.surface_pending_rebuild = False
+            self._detach_surface_pipeline()
             self._set_busy(False)
             self._clear_surface_items()
         self.update_lod(force_recolor=True)
@@ -1789,13 +1874,17 @@ class MainWindow(QMainWindow):
             return
 
         if self.multi_mode:
-            paths, _ = QFileDialog.getOpenFileNames(self, self._t("add_files"), "", "LAZ (*.laz)")
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, self._t("add_files"), "", "LiDAR files (*.laz *.copc.laz)"
+            )
             if not paths:
                 return
             self._start_loading(paths, replace_all=False)
             return
 
-        path, _ = QFileDialog.getOpenFileName(self, self._t("open_file"), "", "LAZ (*.laz)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, self._t("open_file"), "", "LiDAR files (*.laz *.copc.laz)"
+        )
         if not path:
             return
         self._start_loading([path], replace_all=True)
@@ -1806,12 +1895,19 @@ class MainWindow(QMainWindow):
         self._set_status(self._t("loading_files", count=len(paths)))
         self._set_busy(True, self._t("reading_laz"))
 
-        self.thread = LoaderThread(paths)
+        self.thread = LoaderThread(
+            paths,
+            max_points_per_tile=self._max_points_per_tile(),
+            max_workers=self._loader_workers(),
+        )
         self.thread.loaded.connect(self.on_tiles_loaded)
         self.thread.failed.connect(self.on_load_failed)
         self.thread.start()
 
     def on_tiles_loaded(self, loaded_tiles, warnings):
+        # Ignore stale loader callbacks after a reset/refresh switched thread context.
+        if self.sender() is not self.thread:
+            return
         self._remember_error("")
         if self.pending_replace_all:
             self.tiles.clear()
@@ -1823,6 +1919,10 @@ class MainWindow(QMainWindow):
                 "classification": tile.get("classification"),
             }
 
+        budget_warning = self._enforce_memory_budget()
+        if budget_warning:
+            warnings.append(budget_warning)
+
         self.last_load_warnings = warnings
         self._refresh_tile_selector()
         self._start_scene_build()
@@ -1831,7 +1931,37 @@ class MainWindow(QMainWindow):
         self.pending_replace_all = False
         self.thread = None
 
+    def _enforce_memory_budget(self):
+        budget = self._max_total_points_budget()
+        total = sum(len(t["points"]) for t in self.tiles.values() if t.get("points") is not None)
+        if total <= budget:
+            return ""
+
+        ratio = budget / max(total, 1)
+        kept_total = 0
+        for path, tile in self.tiles.items():
+            pts = tile.get("points")
+            if pts is None or len(pts) == 0:
+                continue
+            target = max(10_000, int(len(pts) * ratio))
+            if target >= len(pts):
+                kept_total += len(pts)
+                continue
+            keep = np.linspace(0, len(pts) - 1, target, dtype=np.int64)
+            tile["points"] = np.ascontiguousarray(pts[keep], dtype=np.float32)
+            cls = tile.get("classification")
+            if cls is not None and len(cls) == len(pts):
+                tile["classification"] = np.asarray(cls[keep], dtype=np.uint8)
+            kept_total += len(tile["points"])
+
+        return (
+            f"Memory budget applied: reduced raw points to ~{kept_total:,} "
+            f"(target {budget:,})."
+        )
+
     def on_load_failed(self, message):
+        if self.sender() is not self.thread:
+            return
         self._remember_error(message)
         self._set_status(message)
         self.btn_load.setEnabled(True)
@@ -1841,6 +1971,8 @@ class MainWindow(QMainWindow):
 
     def _start_scene_build(self):
         self._refresh_tile_selector()
+        # Fresh scene build invalidates previous surface jobs.
+        self._detach_surface_pipeline()
         self.scene_request_counter += 1
         request_id = self.scene_request_counter
         self.scene_active_request = request_id
@@ -1921,6 +2053,7 @@ class MainWindow(QMainWindow):
 
         if self.scatter is None:
             self.scatter = gl.GLScatterPlotItem()
+            self.scatter.setGLOptions("opaque")
             self.view.addItem(self.scatter)
         self._clear_surface_items()
 
@@ -1957,6 +2090,10 @@ class MainWindow(QMainWindow):
         ].astype(np.float32)
 
     def clear_loaded_data(self):
+        # Detach from in-flight loader; late callbacks are ignored by sender-check.
+        self.thread = None
+        self.pending_replace_all = False
+        self.btn_load.setEnabled(True)
         self.tiles.clear()
         self.points_centered = None
         self.world_center = None
@@ -1971,10 +2108,10 @@ class MainWindow(QMainWindow):
         self.sat_pending_request = None
         self.sat_payload.clear()
         self.sat_active_request = None
+        self.last_load_warnings = []
         self.active_classes.clear()
         self.lod_timer.stop()
-        self.surface_active_request = None
-        self.surface_pending_rebuild = False
+        self._detach_surface_pipeline()
         self._set_busy(False)
         self._refresh_tile_selector()
         self._refresh_class_filters()
@@ -2088,8 +2225,7 @@ class MainWindow(QMainWindow):
         self.sat_pending_request = None
         self.sat_payload.clear()
         self.sat_active_request = None
-        self.surface_active_request = None
-        self.surface_pending_rebuild = False
+        self._detach_surface_pipeline()
         self._clear_surface_items()
         if self.scatter is not None:
             self.scatter.setData(
@@ -2107,6 +2243,16 @@ class MainWindow(QMainWindow):
         self.busy_title.setText(title or self._t("processing"))
         self.busy_popup.setVisible(busy)
 
+    def _detach_surface_pipeline(self):
+        """Detach surface build state from any in-flight worker.
+
+        We intentionally do not force-kill threads here. Late signals are ignored by
+        request-id checks, and clearing references lets new rebuilds start immediately.
+        """
+        self.surface_active_request = None
+        self.surface_pending_rebuild = False
+        self.surface_thread = None
+
     def _clear_surface_items(self):
         if not hasattr(self, "surface_items"):
             self.surface_items = {}
@@ -2120,7 +2266,9 @@ class MainWindow(QMainWindow):
             return
         self.surface_pending_rebuild = True
         if self.surface_thread is not None and self.surface_thread.isRunning():
-            return
+            # If active request is gone, the running worker is stale; don't block new builds.
+            if self.surface_active_request is not None:
+                return
         self._launch_surface_rebuild()
 
     def _launch_surface_rebuild(self):
@@ -2166,6 +2314,7 @@ class MainWindow(QMainWindow):
     def _on_surface_built(self, request_id, payload, note):
         if request_id != self.surface_active_request:
             return
+        self.surface_thread = None
         # Surface generation is asynchronous; ignore payload if user switched
         # back to point mode while the thread was still running.
         if not self._is_surface_view():
@@ -2177,6 +2326,7 @@ class MainWindow(QMainWindow):
                 item = gl.GLSurfacePlotItem(
                     x=xs, y=ys, z=zf, colors=colors_vertices, shader="shaded", smooth=False
                 )
+                item.setGLOptions("opaque")
                 new_items[tile_path] = item
             except Exception:
                 continue
@@ -2206,6 +2356,7 @@ class MainWindow(QMainWindow):
     def _on_surface_failed(self, request_id, error):
         if request_id != self.surface_active_request:
             return
+        self.surface_thread = None
         self._remember_error(error)
         self._set_busy(False)
         self.last_color_note = f"surface error: {error}"
@@ -2424,6 +2575,7 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
