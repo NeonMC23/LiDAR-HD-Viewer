@@ -840,9 +840,9 @@ class MainWindow(QMainWindow):
             "language": "en",
             "theme": "midnight",
             "ui_scale": 100,
-            "popup_width_percent": 34,
+            "popup_width_percent": 18,
             "compact_toolbar": False,
-            "show_tile_centers": True,
+            "show_tile_centers": False,
         }
         self.status_key = "status_ready"
         self.status_kwargs = {}
