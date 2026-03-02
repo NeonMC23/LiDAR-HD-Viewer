@@ -1,4 +1,4 @@
-﻿# LiDAR View
+# LiDAR View
 
 LiDAR View is a desktop viewer for `.laz` / `.las` point clouds (LiDAR tiles), with multi-tile loading, LOD rendering, satellite color projection, and opaque surface rendering.
 
@@ -75,7 +75,7 @@ python .\main.py
 - `Load .laz (replace)`: load one file and replace current scene
 - `Multi mode: OFF/ON`: switch between replace/append behavior
 - `Reset data`: clear loaded data
-- `Reset camera`: restore default camera
+- `Refresh data`: rebuild rendering/cache state from currently loaded tiles
 - `View`: `Points` or `Opaque surface`
 - `Surface`: `Auto (recommended)` or `Manual`
 - `Surface precision` (when Manual): custom grid size
@@ -121,6 +121,7 @@ python .\main.py
 - Prefer `Surface = Auto (recommended)` unless you need strict manual control.
 - In multi-tile workflows, append progressively and validate alignment before adding many tiles.
 - If the machine is constrained, enable `Compact toolbar` and lower `Quality`.
+- Tile points are internally kept in `float32` for lower RAM usage in large multi-tile projects.
 
 ## Troubleshooting
 
