@@ -1,4 +1,4 @@
-﻿"""LAZ/LAS loading helpers for LiDAR View."""
+"""LAZ/LAS loading helpers for LiDAR View."""
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -56,7 +56,66 @@ def read_crs_string(las: laspy.LasData) -> Optional[str]:
 
 
 def load_laz_tile(path: str) -> LoadedTile:
-    las = laspy.read(path)
+    p = str(path).lower()
+    is_copc = p.endswith(".copc.laz")
+    try:
+        las = laspy.read(path)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if is_copc:
+            try:
+                from laspy import CopcReader
+            except Exception as copc_import_exc:
+                raise RuntimeError(
+                    "COPC reader unavailable in current laspy build. "
+                    "Install/upgrade laspy>=2.4 and lazrs, then restart the app."
+                ) from copc_import_exc
+
+            try:
+                with CopcReader.open(path) as reader:
+                    rec = reader.query()
+                    points = np.column_stack((rec.x, rec.y, rec.z)).astype(np.float64, copy=False)
+
+                    crs = None
+                    try:
+                        parsed = reader.header.parse_crs()
+                        if parsed is not None:
+                            crs = parsed.to_string()
+                    except Exception:
+                        crs = None
+                    if crs is None:
+                        crs = infer_crs_from_points(points)
+
+                    classification = None
+                    try:
+                        if hasattr(rec, "classification"):
+                            classification = np.asarray(rec.classification, dtype=np.uint8)
+                            if len(classification) != len(points):
+                                classification = None
+                    except Exception:
+                        classification = None
+
+                    return LoadedTile(
+                        path=str(Path(path).resolve()),
+                        points=points,
+                        crs=crs,
+                        classification=classification,
+                    )
+            except Exception as copc_exc:
+                copc_msg = str(copc_exc).lower()
+                if "lazrs" in copc_msg or "backend" in copc_msg or "decompress" in copc_msg:
+                    raise RuntimeError(
+                        "COPC requires LAZ decompression backend `lazrs`. "
+                        "Run: .\\.venv\\Scripts\\python.exe -m pip install --upgrade lazrs"
+                    ) from copc_exc
+                raise RuntimeError(f"Failed to read COPC file: {copc_exc}") from copc_exc
+
+        if "lazbackend" in msg or ("decompress" in msg and ".laz" in str(path).lower()):
+            raise RuntimeError(
+                "LAZ backend missing: install `lazrs` (recommended) or `laszip`, "
+                "then restart the app."
+            ) from exc
+        raise
 
     # Convert integer LAS storage to real-world coordinates using header metadata.
     scales = np.asarray(las.header.scales, dtype=np.float64)
@@ -103,4 +162,3 @@ def load_laz(path: str, max_points: Optional[int] = None):
     points = (points - center).astype(np.float32)
 
     return points, colors
-
