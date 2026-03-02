@@ -1,4 +1,4 @@
-﻿"""Legacy OpenGL fallback viewer used for debugging and compatibility."""
+"""Legacy OpenGL fallback viewer used for debugging and compatibility."""
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import (
     GL_COLOR_BUFFER_BIT,
