@@ -59,7 +59,10 @@ def load_laz_tile(path: str) -> LoadedTile:
     p = str(path).lower()
     is_copc = p.endswith(".copc.laz")
     try:
-        las = laspy.read(path)
+        try:
+            las = laspy.read(path, laz_backend=laspy.LazBackend.LazrsParallel)
+        except Exception:
+            las = laspy.read(path)
     except Exception as exc:
         msg = str(exc).lower()
         if is_copc:
