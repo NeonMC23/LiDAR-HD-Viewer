@@ -35,6 +35,7 @@ import sys
 modules = [
     "numpy",
     "laspy",
+    "lazrs",
     "PyQt6",
     "pyqtgraph",
     "OpenGL",
