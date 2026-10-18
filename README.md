@@ -1,7 +1,3 @@
- <p align="center">
-  <img src="assets/image1.png" alt="LiDAR View — Satellite point cloud visualization" width="100%">
-</p>
-
 <h1 align="center">LiDAR View</h1>
 
 <p align="center">
