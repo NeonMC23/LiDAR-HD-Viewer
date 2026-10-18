@@ -1,4 +1,4 @@
-# LiDAR View
+# LiDAR Vie
 
 LiDAR View is a desktop viewer for `.laz` / `.las` point clouds (LiDAR tiles), with multi-tile loading, LOD rendering, satellite color projection, and opaque surface rendering.
 
